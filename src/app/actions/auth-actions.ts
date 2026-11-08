@@ -1,0 +1,201 @@
+"use server";
+
+import bcrypt from "bcryptjs";
+import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
+import { prisma } from "@/lib/prisma";
+import {
+  clearSessionCookie,
+  setSessionCookie,
+  type SessionUser,
+} from "@/lib/auth";
+import { sendTransactionalEmail } from "@/lib/email";
+
+/**
+ * Login menggunakan email dan password.
+ * Menerapkan prinsip Anti-Enumerasi Email (PRD 14.5):
+ * Pesan kesalahan sama baik email terdaftar maupun tidak.
+ */
+export async function loginWithPasswordAction(formData: FormData) {
+  const email = (formData.get("email") as string | null)?.trim().toLowerCase();
+  const password = (formData.get("password") as string | null) ?? "";
+
+  if (!email || !password) {
+    return { error: "Email dan kata sandi wajib diisi." };
+  }
+
+  const genericError =
+    "Kredensial tidak valid atau akun belum dapat digunakan. Silakan periksa kembali.";
+
+  const user = await prisma.user.findUnique({
+    where: { email },
+    include: {
+      company: { select: { name: true } },
+      technicianProfile: { select: { approvalStatus: true } },
+    },
+  });
+
+  if (!user || !user.passwordHash || !user.isActive || user.isBlocked) {
+    return { error: genericError };
+  }
+
+  // Teknisi belum disetujui tidak bisa login
+  if (
+    user.role === "TEKNISI" &&
+    user.technicianProfile &&
+    user.technicianProfile.approvalStatus !== "APPROVED"
+  ) {
+    return { error: genericError };
+  }
+
+  const valid = await bcrypt.compare(password, user.passwordHash);
+  if (!valid) {
+    return { error: genericError };
+  }
+
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { lastLoginAt: new Date() },
+  });
+
+  const sessionUser: SessionUser = {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    companyId: user.companyId,
+    companyName: user.company?.name ?? null,
+    staffClusterId: user.staffClusterId,
+  };
+
+  await setSessionCookie(sessionUser);
+  redirect("/dashboard");
+}
+
+/**
+ * Meminta kode OTP ke email (Anti-enumerasi: pesan respons selalu sama).
+ */
+export async function requestOtpAction(emailInput: string) {
+  const email = emailInput.trim().toLowerCase();
+  if (!email) {
+    return { error: "Masukkan alamat email yang valid." };
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { email },
+  });
+
+  if (user && user.isActive && !user.isBlocked) {
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 menit
+
+    await prisma.otpCode.create({
+      data: {
+        email,
+        code,
+        expiresAt,
+      },
+    });
+
+    await sendTransactionalEmail({
+      companyId: user.companyId,
+      toEmail: email,
+      subject: `Kode OTP Masuk GreenPark: ${code}`,
+      bodyHtml: `<p>Kode verifikasi satu kali (OTP) Anda adalah: <strong style="font-size:18px;">${code}</strong> (berlaku 10 menit).</p>`,
+      triggerType: "OTP_LOGIN",
+    });
+  }
+
+  // Respons identik baik email terdaftar maupun belum (Anti-enumerasi PRD 14.5)
+  return {
+    success: true,
+    message:
+      "Jika alamat email terdaftar dan aktif, kode OTP telah dikirimkan ke email tersebut (cek juga log Email Outbox di dev).",
+  };
+}
+
+/**
+ * Verifikasi kode OTP untuk login.
+ */
+export async function verifyOtpAction(emailInput: string, codeInput: string) {
+  const email = emailInput.trim().toLowerCase();
+  const code = codeInput.trim();
+
+  const otp = await prisma.otpCode.findFirst({
+    where: {
+      email,
+      code,
+      usedAt: null,
+      expiresAt: { gte: new Date() },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+
+  if (!otp) {
+    return { error: "Kode OTP tidak valid atau sudah kedaluwarsa." };
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { email },
+    include: { company: { select: { name: true } } },
+  });
+
+  if (!user || !user.isActive || user.isBlocked) {
+    return { error: "Kode OTP tidak valid atau sudah kedaluwarsa." };
+  }
+
+  await prisma.otpCode.update({
+    where: { id: otp.id },
+    data: { usedAt: new Date() },
+  });
+
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { lastLoginAt: new Date() },
+  });
+
+  await setSessionCookie({
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    companyId: user.companyId,
+    companyName: user.company?.name ?? null,
+    staffClusterId: user.staffClusterId,
+  });
+
+  redirect("/dashboard");
+}
+
+/**
+ * Fitur khusus pengujian Fase 0: Pindah cepat antar 7 role dengan 1 klik.
+ */
+export async function quickSwitchRoleAction(email: string) {
+  const user = await prisma.user.findUnique({
+    where: { email },
+    include: { company: { select: { name: true } } },
+  });
+
+  if (!user) {
+    throw new Error(`Akun demo ${email} belum tersedia. Jalankan seed dulu.`);
+  }
+
+  await setSessionCookie({
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    companyId: user.companyId,
+    companyName: user.company?.name ?? null,
+    staffClusterId: user.staffClusterId,
+  });
+
+  revalidatePath("/dashboard");
+  redirect("/dashboard");
+}
+
+export async function logoutAction() {
+  await clearSessionCookie();
+  redirect("/login");
+}
+
